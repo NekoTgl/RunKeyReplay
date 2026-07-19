@@ -7,6 +7,8 @@ namespace RunKeyReplay;
 internal static class Program
 {
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string StartupApprovedRunKeyPath =
+        @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
     private const int ErrorInvalidData = 13;
     private const int ErrorInvalidParameter = 87;
     private const int ErrorInvalidDatatype = 1804;
@@ -69,7 +71,13 @@ internal static class Program
             // otherwise modify a Run key and change which later values this tool observes.
             foreach (var location in locations)
             {
-                values.AddRange(ReadValues(location, options, summary));
+                var locationValues = ReadValues(location, options, summary);
+                if (!options.IncludeDisabled)
+                {
+                    ApplyStartupApprovalStates(location, locationValues, summary);
+                }
+
+                values.AddRange(locationValues);
             }
 
             foreach (var value in values)
@@ -188,6 +196,159 @@ internal static class Program
         return values;
     }
 
+    private static void ApplyStartupApprovalStates(
+        RegistryLocation location,
+        List<RunValue> values,
+        ReplaySummary summary)
+    {
+        if (values.Count == 0)
+        {
+            return;
+        }
+
+        var approvalLocation = location with { Path = StartupApprovedRunKeyPath };
+        var access = NativeMethods.KEY_QUERY_VALUE | NativeMethods.KEY_WOW64_64KEY;
+        var status = NativeMethods.RegOpenKeyExW(
+            approvalLocation.Root,
+            approvalLocation.Path,
+            0,
+            access,
+            out var approvalKey);
+
+        // Windows creates StartupApproved values only after a user or the system records a
+        // choice.  A missing key therefore means every Run value keeps its normal enabled state.
+        if (status == NativeMethods.ERROR_FILE_NOT_FOUND)
+        {
+            return;
+        }
+
+        if (status != NativeMethods.ERROR_SUCCESS)
+        {
+            WriteFailure(approvalLocation, null, "RegOpenKeyExW", status);
+            summary.Failures++;
+            SetApprovalState(values, StartupApprovalState.Undetermined);
+            return;
+        }
+
+        try
+        {
+            for (var index = 0; index < values.Count; index++)
+            {
+                var value = values[index];
+                status = TryReadStartupApprovalState(approvalKey, value.ValueName, out var approvalState);
+                if (status != NativeMethods.ERROR_SUCCESS)
+                {
+                    WriteFailure(approvalLocation, value.ValueName, "Read StartupApproved state", status);
+                    summary.Failures++;
+                    values[index] = value with { ApprovalState = StartupApprovalState.Undetermined };
+                    continue;
+                }
+
+                values[index] = value with { ApprovalState = approvalState };
+            }
+        }
+        finally
+        {
+            NativeMethods.RegCloseKey(approvalKey);
+        }
+    }
+
+    private static int TryReadStartupApprovalState(
+        IntPtr approvalKey,
+        string valueName,
+        out StartupApprovalState approvalState)
+    {
+        approvalState = StartupApprovalState.Undetermined;
+        uint dataLength = 0;
+        var status = NativeMethods.RegQueryValueExW(
+            approvalKey,
+            valueName,
+            IntPtr.Zero,
+            out var valueType,
+            null,
+            ref dataLength);
+
+        // An absent value has never been disabled through Startup Apps and is enabled by default.
+        if (status == NativeMethods.ERROR_FILE_NOT_FOUND)
+        {
+            approvalState = StartupApprovalState.Enabled;
+            return NativeMethods.ERROR_SUCCESS;
+        }
+
+        if (status != NativeMethods.ERROR_SUCCESS)
+        {
+            return status;
+        }
+
+        if (valueType != NativeMethods.REG_BINARY)
+        {
+            return ErrorInvalidDatatype;
+        }
+
+        if (dataLength == 0)
+        {
+            return ErrorInvalidData;
+        }
+
+        var capacity = BufferCapacity(dataLength, includeNullTerminator: false);
+        if (capacity < dataLength)
+        {
+            return NativeMethods.ERROR_MORE_DATA;
+        }
+
+        // The value can change while it is being queried, so apply the same bounded retry
+        // strategy used for Run-value enumeration.
+        for (var attempt = 0; attempt < 4; attempt++)
+        {
+            var data = new byte[capacity];
+            uint copiedLength = checked((uint)data.Length);
+            status = NativeMethods.RegQueryValueExW(
+                approvalKey,
+                valueName,
+                IntPtr.Zero,
+                out valueType,
+                data,
+                ref copiedLength);
+
+            if (status == NativeMethods.ERROR_SUCCESS)
+            {
+                if (valueType != NativeMethods.REG_BINARY)
+                {
+                    return ErrorInvalidDatatype;
+                }
+
+                if (copiedLength == 0 || copiedLength > (uint)data.Length)
+                {
+                    return ErrorInvalidData;
+                }
+
+                // StartupApproved's binary payload is intentionally opaque, but Windows uses
+                // the low bit of its first byte as the state: even is enabled and odd is
+                // disabled.  This covers the observed 02/03, 06/07, and later state pairs.
+                approvalState = (data[0] & 1) == 0
+                    ? StartupApprovalState.Enabled
+                    : StartupApprovalState.Disabled;
+                return NativeMethods.ERROR_SUCCESS;
+            }
+
+            if (status != NativeMethods.ERROR_MORE_DATA ||
+                !TryGrowBuffer(capacity, copiedLength, includeNullTerminator: false, out capacity))
+            {
+                return status;
+            }
+        }
+
+        return NativeMethods.ERROR_MORE_DATA;
+    }
+
+    private static void SetApprovalState(List<RunValue> values, StartupApprovalState approvalState)
+    {
+        for (var index = 0; index < values.Count; index++)
+        {
+            values[index] = values[index] with { ApprovalState = approvalState };
+        }
+    }
+
     private static int TryReadValue(
         IntPtr key,
         uint index,
@@ -257,6 +418,18 @@ internal static class Program
 
     private static void ReplayValue(RunValue value, Options options, ReplaySummary summary)
     {
+        if (!options.IncludeDisabled && value.ApprovalState != StartupApprovalState.Enabled)
+        {
+            var reason = value.ApprovalState == StartupApprovalState.Disabled
+                ? "Task Manager marks this startup item as disabled"
+                : "its StartupApproved state could not be determined";
+            WriteInfo(
+                options,
+                $"[{value.Location.Hive}] {FormatValueName(value.ValueName)}: skipped because {reason}.");
+            summary.Skipped++;
+            return;
+        }
+
         if (!TryPrepareCommand(value, out var commandLine, out var errorCode, out var errorOperation))
         {
             WriteFailure(value.Location, value.ValueName, errorOperation, errorCode);
@@ -630,6 +803,7 @@ internal static class Program
     {
         var quiet = false;
         var dryRun = false;
+        var includeDisabled = false;
         var hkcuOnly = false;
         var hklmOnly = false;
         var help = false;
@@ -643,6 +817,9 @@ internal static class Program
                     break;
                 case "--dry-run":
                     dryRun = true;
+                    break;
+                case "--include-disabled":
+                    includeDisabled = true;
                     break;
                 case "--hkcu-only":
                     hkcuOnly = true;
@@ -669,18 +846,19 @@ internal static class Program
             return false;
         }
 
-        options = new Options(quiet, dryRun, hkcuOnly, hklmOnly, help);
+        options = new Options(quiet, dryRun, includeDisabled, hkcuOnly, hklmOnly, help);
         error = string.Empty;
         return true;
     }
 
     private static void PrintUsage()
     {
-        Console.WriteLine("Usage: RunKeyReplay [--quiet] [--dry-run] [--hkcu-only | --hklm-only]");
+        Console.WriteLine("Usage: RunKeyReplay [--quiet] [--dry-run] [--include-disabled] [--hkcu-only | --hklm-only]");
         Console.WriteLine();
-        Console.WriteLine("Replays the x64 HKLM/HKCU CurrentVersion\\Run values in the current user context.");
+        Console.WriteLine("Replays enabled x64 HKLM/HKCU CurrentVersion\\Run values in the current user context.");
         Console.WriteLine("  --quiet      Suppress normal status output (errors are still written).");
         Console.WriteLine("  --dry-run    Read, validate, expand, and show planned launches without launching.");
+        Console.WriteLine("  --include-disabled  Also replay items disabled in Task Manager Startup Apps.");
         Console.WriteLine("  --hkcu-only  Replay only HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run.");
         Console.WriteLine("  --hklm-only  Replay only HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run.");
     }
@@ -725,13 +903,31 @@ internal static class Program
         return escaped.ToString();
     }
 
-    private readonly record struct Options(bool Quiet, bool DryRun, bool HkcuOnly, bool HklmOnly, bool Help);
+    private readonly record struct Options(
+        bool Quiet,
+        bool DryRun,
+        bool IncludeDisabled,
+        bool HkcuOnly,
+        bool HklmOnly,
+        bool Help);
 
     private readonly record struct RegistryLocation(string Hive, IntPtr Root, string Path);
 
-    private readonly record struct RunValue(RegistryLocation Location, string ValueName, uint ValueType, byte[] Data);
+    private readonly record struct RunValue(
+        RegistryLocation Location,
+        string ValueName,
+        uint ValueType,
+        byte[] Data,
+        StartupApprovalState ApprovalState = StartupApprovalState.Enabled);
 
     private readonly record struct ShellInvocation(string File, string? Parameters);
+
+    private enum StartupApprovalState
+    {
+        Enabled,
+        Disabled,
+        Undetermined,
+    }
 
     private sealed class ReplaySummary
     {

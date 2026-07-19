@@ -15,6 +15,7 @@ internal static class NativeMethods
 
     internal const uint REG_SZ = 1;
     internal const uint REG_EXPAND_SZ = 2;
+    internal const uint REG_BINARY = 3;
 
     // A console process launched by Explorer/userinit would not inherit this tool's console.
     internal const uint CREATE_NEW_CONSOLE = 0x00000010;
@@ -59,6 +60,15 @@ internal static class NativeMethods
         IntPtr lpReserved,
         out uint lpType,
         [Out] byte[] lpData,
+        ref uint lpcbData);
+
+    [DllImport("advapi32.dll", EntryPoint = "RegQueryValueExW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    internal static extern int RegQueryValueExW(
+        IntPtr hKey,
+        string? lpValueName,
+        IntPtr lpReserved,
+        out uint lpType,
+        [Out] byte[]? lpData,
         ref uint lpcbData);
 
     [DllImport("advapi32.dll", ExactSpelling = true)]
