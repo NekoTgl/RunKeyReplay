@@ -39,7 +39,7 @@ Every registry, expansion, or launch failure is reported with a decimal and hexa
 
 ## Build and publish
 
-The project is configured for x64, `win-x64`, self-contained, single-file publishing. Version 1.0.1 build output goes under `bin\x64\Release\v1.0.1\`, and publishing goes to `releases\RunKeyReplay-v1.0.1\`; this keeps it separate from an existing 1.0.0 output. With the .NET 8 SDK installed:
+The project is configured for x64, `win-x64`, self-contained, single-file publishing. With the .NET 8 SDK installed:
 
 ```powershell
 dotnet build -c Release -p:Platform=x64
