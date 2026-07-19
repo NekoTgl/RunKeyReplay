@@ -1,4 +1,4 @@
-# RunKeyReplay 1.0.1
+# RunKeyReplay
 
 `RunKeyReplay` is a .NET 8 x64 Windows console application that replays enabled values in these two native 64-bit registry keys:
 
