@@ -36,18 +36,3 @@ The scope switches are mutually exclusive. The default is HKLM first and then HK
 - Starts console children in a new console, avoiding accidental inheritance of this tool's console. It uses `%SystemRoot%\System32` as an Explorer-like working-directory approximation.
 
 Every registry, expansion, or launch failure is reported with a decimal and hexadecimal Win32 error code. The process exits `0` if all selected work completed, `1` after one or more operational failures, and `2` for invalid arguments.
-
-## Build and publish
-
-The project is configured for x64, `win-x64`, self-contained, single-file publishing. With the .NET 8 SDK installed:
-
-```powershell
-dotnet build -c Release -p:Platform=x64
-dotnet publish -c Release
-```
-
-The publish output is a self-contained Windows x64 single-file executable. Native runtime pieces may be extracted to the standard .NET single-file extraction cache at runtime.
-
-The project deliberately does not cover RunOnce, Startup folders, policies, scheduled tasks, services, Safe Mode filtering, alternate users/sessions, elevation, or logon-time startup delays. To best approximate an ordinary interactive logon, run it unelevated in the target user's interactive session.
-
-Microsoft documents Run values as command lines, with indeterminate order and possible delayed execution: [Run and RunOnce Registry Keys](https://learn.microsoft.com/windows/win32/setupapi/run-and-runonce-registry-keys). The raw command-line behavior follows [CreateProcessW](https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw), and the shell path follows [ShellExecuteExW](https://learn.microsoft.com/windows/win32/api/shellapi/nf-shellapi-shellexecuteexw).
